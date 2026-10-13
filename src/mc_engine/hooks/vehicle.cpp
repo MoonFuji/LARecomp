@@ -171,14 +171,27 @@ void MCLAChassisGroundPushbackDamper(PPCRegister& f0, PPCRegister& f3) {
     f3.f64 = std::clamp(unclamped_v, -12.0f, 12.0f);
 }
 
-// BadassBaboon's Recomp Adjustments: Suspension ground pushback acceleration limiter
+// BadassBaboon's Recomp Adjustments: Suspension ground pushback acceleration limiter and high-FPS impulse scaling
 // 0x82563850: entry after bl sub_825A3D90 in sub_82563298.
 // f1 is the acceleration returned by sub_825A3D90.
 // Limiting excessive pushback acceleration prevents single-frame spring spikes from kicking the chassis upward.
+// At > 60 FPS (e.g. 100, 120, 144, 240+ FPS uncapped), sub_82563298 executes 1/dt times per second instead of 60.
+// Scaling by min(1.0f, dt * 60.0f) ensures that the cumulative pushback impulse per second matches the 60 Hz reference
+// and prevents suspension over-stiffening or hopping at high frame rates.
 void MCLAChassisPushbackAccel(PPCRegister& f1) {
     if (!REXCVAR_GET(smooth_chassis_depth)) return;
 
-    f1.f64 = std::clamp(static_cast<float>(f1.f64), -100.0f, 120.0f);
+    auto* base = rex::Runtime::instance()->virtual_membase();
+    float dt_scale = 1.0f;
+    if (base) {
+        const float dt = ReadGuestF32(base, kGuestFrameDelta);
+        if (dt > 0.0f && dt < (1.0f / 60.0f)) {
+            dt_scale = dt * 60.0f;
+        }
+    }
+
+    const float clamped_a = std::clamp(static_cast<float>(f1.f64), -100.0f, 120.0f);
+    f1.f64 = static_cast<double>(clamped_a * dt_scale);
 }
 
 // BadassBaboon's Recomp Adjustments: Vehicle chassis angular velocity continuous-time smoothing
