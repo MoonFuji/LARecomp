@@ -76,6 +76,10 @@ void Hook_PhotoModeCapture(PPCRegister& r3);
 // BadassBaboon's Recomp Adjustments: Continuous-time exponential camera smoothing, suspension damping & vehicle physics filters
 void MCLACameraPosSmoothing(PPCRegister& f13);
 void MCLACameraLookAtSmoothing(PPCRegister& f0);
+void MCLACameraShakeScaling(PPCRegister& f31);
+void MCLACameraGimbalSmoothing(PPCRegister& f31);
+void MCLACameraYawShortestPath(PPCRegister& f0);
+void MCLACameraTransitionSlerp(PPCRegister& r31, PPCRegister& r1, PPCRegister& r26);
 void MCLAChassisDepthSmoothing(PPCRegister& f0);
 void MCLAChassisGroundPushbackDamper(PPCRegister& f0, PPCRegister& f3);
 void MCLAChassisPushbackAccel(PPCRegister& f1);

@@ -25905,6 +25905,42 @@ name = "MCLACameraLookAtSmoothing"
 address = 0x823204F4
 registers = ["f0"]
 
+# BadassBaboon's Recomp Adjustments: Camera shake amplitude scaling for high and uncapped framerates
+# 0x823150C8: fmuls f31, f12, f11 in sub_82315000 (channel shake amplitude evaluation).
+# Scales the white noise angular and positional displacements by (60 * dt) when dt < 1/60s.
+[[midasm_hook]]
+name = "MCLACameraShakeScaling"
+address = 0x823150C8
+after_instruction = true
+registers = ["f31"]
+
+# BadassBaboon's Recomp Adjustments: Lookaround & camera boom gimbal continuous-time exponential smoothing
+# 0x822B30A4: lfs f31, 0x30(r10) in sub_822B2AB0 (mcPlayerCamera update).
+# f31 is the raw per-frame LookaroundLerpFactor (tune+48), converted to continuous time decay.
+[[midasm_hook]]
+name = "MCLACameraGimbalSmoothing"
+address = 0x822B30A4
+after_instruction = true
+registers = ["f31"]
+
+# BadassBaboon's Recomp Adjustments: Lookaround yaw shortest-path angular delta
+# 0x822B30AC: fsubs f0, f27, f1 in sub_822B2AB0.
+# Wraps delta_yaw into [-pi, +pi] to prevent 360-degree spins across the +/-pi seam.
+[[midasm_hook]]
+name = "MCLACameraYawShortestPath"
+address = 0x822B30AC
+after_instruction = true
+registers = ["f0"]
+
+# BadassBaboon's Recomp Adjustments: Camera transition & intro orbit Quaternion SLERP stabilization
+# 0x8271F920: bl sub_821B9B28 in sub_8271F438 (camTransition::Update).
+# Replaces Euler ZXY angle decomposition with shortest-path Quaternion SLERP on SO(3).
+[[midasm_hook]]
+name = "MCLACameraTransitionSlerp"
+address = 0x8271F920
+after_instruction = true
+registers = ["r31", "r1", "r26"]
+
 # BadassBaboon's Recomp Adjustments: Vehicle chassis suspension damping & ground depth filter continuous-time scaling
 # 0x82563720: lis r11, flt_82001D14@ha in sub_82563298.
 # f0 is the chassis ground depth filter coefficient alpha (0.10 at 30 FPS, 0.05 at 60 FPS).
