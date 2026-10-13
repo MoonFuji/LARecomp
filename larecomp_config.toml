@@ -25913,6 +25913,47 @@ name = "MCLAChassisDepthSmoothing"
 address = 0x82563720
 registers = ["f0"]
 
+# BadassBaboon's Recomp Adjustments: Suspension ground pushback damper velocity authority expansion
+# 0x8256384C: before bl sub_825A3D90 in sub_82563298.
+# f0 = unclamped penetration velocity, f3 = velocity clamped to [-2.5, +2.5].
+# Expands velocity clamp to [-12.0, +12.0] so the critically-damped PD solver retains full damping authority under high Gs.
+[[midasm_hook]]
+name = "MCLAChassisGroundPushbackDamper"
+address = 0x8256384C
+registers = ["f0", "f3"]
+
+# BadassBaboon's Recomp Adjustments: Suspension ground pushback acceleration limiter
+# 0x82563850: entry after bl sub_825A3D90 in sub_82563298.
+# f1 = pushback acceleration. Clamps excessive impulses to prevent explosive kicks off the pavement.
+[[midasm_hook]]
+name = "MCLAChassisPushbackAccel"
+address = 0x82563850
+registers = ["f1"]
+
+# BadassBaboon's Recomp Adjustments: Vehicle chassis angular velocity continuous-time smoothing
+# 0x8236895C: loc_8236895C in sub_823688B8 (car physics solver).
+# f13 is the chassis angular velocity filter coefficient alpha (0.80 at 30 FPS, 0.40 at >= 60 FPS).
+[[midasm_hook]]
+name = "MCLACarAngularVelocitySmoothing"
+address = 0x8236895C
+registers = ["f13"]
+
+# BadassBaboon's Recomp Adjustments: Vehicle chassis angular acceleration / rotational G-forces continuous-time smoothing
+# 0x823689F0: loc_823689F0 in sub_823688B8 (car physics solver).
+# f0 is the chassis angular acceleration filter coefficient alpha (0.30 at 30 FPS, 0.15 at >= 60 FPS).
+[[midasm_hook]]
+name = "MCLACarAngularAccelerationSmoothing"
+address = 0x823689F0
+registers = ["f0"]
+
+# BadassBaboon's Recomp Adjustments: Lateral tire grip & slip velocity continuous-time smoothing
+# 0x82369E40: loc_82369E40 in sub_823688B8 (car physics solver).
+# f0 is the tire slip filter coefficient alpha (0.30 at < 60 FPS, 0.15 at >= 60 FPS).
+[[midasm_hook]]
+name = "MCLATireSlipSmoothing"
+address = 0x82369E40
+registers = ["f0"]
+
 # BadassBaboon's Recomp Adjustments: Dynamic ambient traffic and pedestrian density tuning
 # mcAmbientDensityTuning is the BASE of the ambient zone, not a separate object:
 # sub_826F5CB0 calls its constructor as `sub_826F5B18(a1)` with its own `this`.

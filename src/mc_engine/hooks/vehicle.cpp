@@ -6,6 +6,7 @@
 #include <rex/cvar.h>
 #include <rex/ppc.h>
 #include <rex/runtime.h>
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 
@@ -25,6 +26,11 @@ REXCVAR_DEFINE_BOOL(unlock_wheel_fit, false, "MCLA/Patches", "Allow every stock 
 // BadassBaboon's Recomp Adjustments: Vehicle chassis suspension damping & ground depth continuous filter
 REXCVAR_DEFINE_BOOL(smooth_chassis_depth, true, "MCLA/Physics",
     "Fix: Smooth vehicle chassis suspension and ground depth damping at 60 FPS.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// BadassBaboon's Recomp Adjustments: Continuous-time vehicle physics filters at 60+ FPS
+REXCVAR_DEFINE_BOOL(smooth_vehicle_physics, true, "MCLA/Physics",
+    "Fix: Continuous-time vehicle physics filters (angular velocity, rotational G-forces, tire slip) at 60+ FPS.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 // Traffic (va_) vehicles turned into player cars: chassis-bound substitution.
@@ -147,8 +153,79 @@ void MCLAChassisDepthSmoothing(PPCRegister& f0) {
     if (!base) return;
 
     const float dt = ReadGuestF32(base, kGuestFrameDelta);
-    if (dt > 0.0f) {
+    if (dt > 0.0f && dt <= 0.25f) {
         f0.f64 = 1.0 - std::pow(0.90, static_cast<double>(dt) * 30.0);
+    }
+}
+
+// BadassBaboon's Recomp Adjustments: Suspension ground pushback damper velocity authority expansion
+// 0x8256384C: before bl sub_825A3D90 in sub_82563298.
+// f0 holds the true unclamped penetration velocity (x - x_prev) / dt.
+// f3 holds the velocity clamped to [-2.5, +2.5] by the original code.
+// Clamping to 2.5 m/s clips damping authority during high-G compression/rebound (sharp turns, burnouts),
+// starving the critically-damped PD solver of velocity damping and causing limit-cycle hopping.
+void MCLAChassisGroundPushbackDamper(PPCRegister& f0, PPCRegister& f3) {
+    if (!REXCVAR_GET(smooth_chassis_depth)) return;
+
+    const float unclamped_v = static_cast<float>(f0.f64);
+    f3.f64 = std::clamp(unclamped_v, -12.0f, 12.0f);
+}
+
+// BadassBaboon's Recomp Adjustments: Suspension ground pushback acceleration limiter
+// 0x82563850: entry after bl sub_825A3D90 in sub_82563298.
+// f1 is the acceleration returned by sub_825A3D90.
+// Limiting excessive pushback acceleration prevents single-frame spring spikes from kicking the chassis upward.
+void MCLAChassisPushbackAccel(PPCRegister& f1) {
+    if (!REXCVAR_GET(smooth_chassis_depth)) return;
+
+    f1.f64 = std::clamp(static_cast<float>(f1.f64), -100.0f, 120.0f);
+}
+
+// BadassBaboon's Recomp Adjustments: Vehicle chassis angular velocity continuous-time smoothing
+// 0x8236895C: loc_8236895C in sub_823688B8.
+// f13 is the chassis angular velocity filter coefficient alpha (0.80 at 30 FPS, 0.40 at >= 60 FPS).
+void MCLACarAngularVelocitySmoothing(PPCRegister& f13) {
+    if (!REXCVAR_GET(smooth_vehicle_physics)) return;
+
+    auto* base = rex::Runtime::instance()->virtual_membase();
+    if (!base) return;
+
+    const float dt = ReadGuestF32(base, kGuestFrameDelta);
+    if (dt > 0.0f && dt <= 0.25f) {
+        // Console reference: retention at 30 FPS = (1.0 - 0.80) = 0.20 per step.
+        f13.f64 = 1.0 - std::pow(0.20, static_cast<double>(dt) * 30.0);
+    }
+}
+
+// BadassBaboon's Recomp Adjustments: Vehicle chassis angular acceleration / rotational G-forces continuous-time smoothing
+// 0x823689F0: loc_823689F0 in sub_823688B8.
+// f0 is the chassis angular acceleration filter coefficient alpha (0.30 at 30 FPS, 0.15 at >= 60 FPS).
+void MCLACarAngularAccelerationSmoothing(PPCRegister& f0) {
+    if (!REXCVAR_GET(smooth_vehicle_physics)) return;
+
+    auto* base = rex::Runtime::instance()->virtual_membase();
+    if (!base) return;
+
+    const float dt = ReadGuestF32(base, kGuestFrameDelta);
+    if (dt > 0.0f && dt <= 0.25f) {
+        // Console reference: retention at 30 FPS = (1.0 - 0.30) = 0.70 per step.
+        f0.f64 = 1.0 - std::pow(0.70, static_cast<double>(dt) * 30.0);
+    }
+}
+
+// BadassBaboon's Recomp Adjustments: Lateral tire grip & slip velocity continuous-time smoothing
+// 0x82369E40: loc_82369E40 in sub_823688B8.
+// f0 is the tire slip filter coefficient alpha (0.30 at < 60 FPS, 0.15 at >= 60 FPS).
+void MCLATireSlipSmoothing(PPCRegister& f0) {
+    if (!REXCVAR_GET(smooth_vehicle_physics)) return;
+
+    auto* base = rex::Runtime::instance()->virtual_membase();
+    if (!base) return;
+
+    const float dt = ReadGuestF32(base, kGuestFrameDelta);
+    if (dt > 0.0f && dt <= 0.25f) {
+        // Console reference: retention at 30 FPS = (1.0 - 0.30) = 0.70 per step.
+        f0.f64 = 1.0 - std::pow(0.70, static_cast<double>(dt) * 30.0);
     }
 }
 #else // REXGLUE_HAS_XEO3_TARGET
@@ -161,6 +238,11 @@ void Patch_RideHeightFit(PPCRegister& f30) {}
 bool Patch_WheelFitBypass() { return false; }
 void Patch_BypassVehicleDLC(PPCRegister& r30) {}
 void MCLAChassisDepthSmoothing(PPCRegister& f0) {}
+void MCLAChassisGroundPushbackDamper(PPCRegister& f0, PPCRegister& f3) {}
+void MCLAChassisPushbackAccel(PPCRegister& f1) {}
+void MCLACarAngularVelocitySmoothing(PPCRegister& f13) {}
+void MCLACarAngularAccelerationSmoothing(PPCRegister& f0) {}
+void MCLATireSlipSmoothing(PPCRegister& f0) {}
 void MCLA_TrafficChassisBound_8232D048(PPCRegister& r9, PPCRegister& r11) {}
 void MCLA_TrafficChassisBound_8232D900(PPCRegister& r3, PPCRegister& r11) {}
 void MCLA_TrafficChassisBound_8232E274(PPCRegister& r3, PPCRegister& r31) {}
