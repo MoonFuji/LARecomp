@@ -26654,3 +26654,35 @@ registers = ["r30"]
 address = 0x8231CEB0
 name = "Hook_CameraStateUpdate"
 registers = ["r31"]
+
+# Camera transition smoothing: eliminate wrap discontinuity & jitter
+#
+# sub_8271F438 (cameraTransition::Update) decomposes the source and destination
+# camera matrices into Euler angles ("zxy") and interpolates them before calling
+# sub_821B9B28 at 0x8271F920 to build the transition's view matrix and position.
+# Because the source camera (e.g. mcTrackCS) continues orbiting the car during
+# the transition, the difference (source_yaw - dest_yaw) crosses the +/- pi
+# boundary dynamically mid-transition. When that happens, the engine's 2*pi
+# wrapping correction suddenly adds or subtracts 2*pi from dest_yaw, causing an
+# instantaneous 180-degree flip in the interpolated yaw (delta = 2*pi * t).
+# At 0x8271F920:
+#   r27 = cameraTransition object (a1)
+#   r26 = pointer to transition t (a1 + 204)
+#   r4  = pointer to interpolated Euler angles [pitch, yaw, roll] on stack (sp + 0x70)
+#   r1  = stack pointer
+[[midasm_hook]]
+address = 0x8271F920
+name = "MCLACameraTransitionSmoothing"
+registers = ["r27", "r26", "r4", "r1"]
+
+# Camera transition completion: snap destination camBoomCS to eliminate handover hitch
+#
+# sub_8271F3B0 finishes cameraTransition by activating dest_camera via
+# sub_8271E930. Setting the snap flag (cam + 664 = 1) on camBoomCS / camDynamicBoomCS
+# allows it to immediately align to the vehicle on frame 0 instead of slewing at
+# low tracking speed (25 * dt = ~0.4 units/frame).
+[[midasm_hook]]
+address = 0x8271F3B0
+name = "MCLACameraTransitionComplete"
+registers = ["r3"]
+

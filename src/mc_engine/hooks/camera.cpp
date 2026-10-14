@@ -44,6 +44,12 @@ REXCVAR_DEFINE_DOUBLE(chase_cam_smoothing_factor, 1.0, "MCLA/Camera",
     .range(0.1, 3.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// BadassBaboon's Recomp Adjustments: Smooth camera transition interpolation & wrap fix
+REXCVAR_DEFINE_BOOL(smooth_camera_transitions, true, "MCLA/Camera",
+    "Fix: Eliminate camera transition jitter and 180-degree wrap flipping when transitioning between orbit, menu, and gameplay cameras.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+
 // BadassBaboon's Recomp Adjustments: Continuous-time camera shake scaling
 REXCVAR_DEFINE_BOOL(scale_camera_shake, true, "MCLA/Camera",
     "Fix: Scale camera shake intensity across framerates (60+ FPS) to prevent violent noise jitter during drifts, burnouts, and crashes.")
@@ -373,6 +379,117 @@ void MCLACameraShakeFilter(PPCRegister& f31, PPCRegister& f30, PPCRegister& f29,
         WriteGuestF32(base, sp + 0x78, static_cast<float>(f31.f64));
     }
 }
+
+// BadassBaboon's Recomp Adjustments: Continuous camera transition interpolation & wrap fix
+// In sub_8271F438 at 0x8271F920:
+// When transitioning between camera modes (e.g. boot orbit mcTrackCS -> car chase camBoomCS),
+// the engine decomposes source and destination matrices into Euler angles ("zxy") and interpolates
+// yaw. When (source_yaw - dest_yaw) crosses +/- pi mid-transition, the engine flips dest_yaw by 2*pi,
+// causing a violent 180-degree flip in interpolated yaw (delta = 2*pi * t) and teleporting the camera
+// across the car.
+// Here we latch the shortest angular trajectory at transition start and track vehicle drift smoothly,
+// guaranteeing a strictly continuous, monotonic transition arc across all framerates.
+static bool s_cam_trans_active = false;
+static uint32_t s_cam_trans_obj = 0;
+static uint32_t s_cam_trans_src = 0;
+static uint32_t s_cam_trans_dst = 0;
+static float s_cam_trans_last_t = 0.0f;
+static float s_cam_trans_start_src_yaw = 0.0f;
+static float s_cam_trans_start_dst_yaw = 0.0f;
+static float s_cam_trans_latched_delta = 0.0f;
+
+void MCLACameraTransitionSmoothing(PPCRegister& r27, PPCRegister& r26, PPCRegister& r4, PPCRegister& r1) {
+    if (!REXCVAR_GET(smooth_camera_transitions)) return;
+
+    auto* base = rex::Runtime::instance()->virtual_membase();
+    if (!base) return;
+
+    const uint32_t trans_obj = static_cast<uint32_t>(r27.u64);
+    const uint32_t p_t = static_cast<uint32_t>(r26.u64);
+    const uint32_t p_angles = static_cast<uint32_t>(r4.u64);
+    const uint32_t sp = static_cast<uint32_t>(r1.u64);
+
+    if (!trans_obj || !p_t || !p_angles) return;
+
+    const float t = ReadGuestF32(base, p_t);
+    const uint32_t src_cam = ReadGuestU32(base, trans_obj + 192);
+    const uint32_t dst_cam = ReadGuestU32(base, trans_obj + 196);
+
+    if (!src_cam || !dst_cam) return;
+
+    // Resolve camera matrix: if cam+156 is non-zero, matrix is at cam+80, else cam+16
+    const uint32_t src_mat = (base[src_cam + 156] != 0) ? (src_cam + 80) : (src_cam + 16);
+    const uint32_t dst_mat = (base[dst_cam + 156] != 0) ? (dst_cam + 80) : (dst_cam + 16);
+
+    // Yaw in "zxy" convention is atan2(M[2][0], M[2][2]) = atan2(offset 32, offset 40)
+    const float src_yaw = std::atan2(ReadGuestF32(base, src_mat + 32), ReadGuestF32(base, src_mat + 40));
+    const float dst_yaw = std::atan2(ReadGuestF32(base, dst_mat + 32), ReadGuestF32(base, dst_mat + 40));
+
+    constexpr float kPi = 3.14159265358979323846f;
+    constexpr float kTwoPi = 2.0f * kPi;
+
+    const bool is_new_trans = !s_cam_trans_active ||
+                              trans_obj != s_cam_trans_obj ||
+                              src_cam != s_cam_trans_src ||
+                              dst_cam != s_cam_trans_dst ||
+                              t < s_cam_trans_last_t ||
+                              (t <= 0.05f && s_cam_trans_last_t > 0.5f);
+
+    if (is_new_trans) {
+        float delta = dst_yaw - src_yaw;
+        while (delta > kPi)  delta -= kTwoPi;
+        while (delta < -kPi) delta += kTwoPi;
+
+        s_cam_trans_active = true;
+        s_cam_trans_obj = trans_obj;
+        s_cam_trans_src = src_cam;
+        s_cam_trans_dst = dst_cam;
+        s_cam_trans_start_src_yaw = src_yaw;
+        s_cam_trans_start_dst_yaw = dst_yaw;
+        s_cam_trans_latched_delta = delta;
+    }
+
+    s_cam_trans_last_t = t;
+
+    // Track vehicle / target heading drift relative to transition start
+    float car_drift = dst_yaw - s_cam_trans_start_dst_yaw;
+    while (car_drift > kPi)  car_drift -= kTwoPi;
+    while (car_drift < -kPi) car_drift += kTwoPi;
+
+    const float t_clamped = (t < 0.0f) ? 0.0f : ((t > 1.0f) ? 1.0f : t);
+    const float smooth_yaw = s_cam_trans_start_src_yaw + t_clamped * (s_cam_trans_latched_delta + car_drift);
+
+    // Overwrite interpolated yaw at p_angles + 4 (sp + 0x74) before sub_821B9B28 builds matrix
+    WriteGuestF32(base, p_angles + 4, smooth_yaw);
+    if (sp) {
+        WriteGuestF32(base, sp + 0x64, smooth_yaw);
+    }
+}
+
+// In sub_8271F3B0 at 0x8271F3B0:
+// Transition is finished and dest_camera is activated. Setting snap flag on camBoomCS
+// ensures 0-frame handover lag without slewing delay hitch.
+void MCLACameraTransitionComplete(PPCRegister& r3) {
+    s_cam_trans_active = false;
+    s_cam_trans_obj = 0;
+    s_cam_trans_last_t = 0.0f;
+
+    if (!REXCVAR_GET(smooth_camera_transitions)) return;
+
+    auto* base = rex::Runtime::instance()->virtual_membase();
+    if (!base) return;
+
+    const uint32_t trans_obj = static_cast<uint32_t>(r3.u64);
+    if (!trans_obj) return;
+
+    const uint32_t dst_cam = ReadGuestU32(base, trans_obj + 196);
+    if (dst_cam) {
+        const uint32_t vtable = ReadGuestU32(base, dst_cam);
+        if (vtable == 0x82044DB4 || vtable == 0x82044DF4) {
+            base[dst_cam + 664] = 1;
+        }
+    }
+}
 #else // REXGLUE_HAS_XEO3_TARGET
 // XEO3 stubs: empty implementations so the linker resolves codegen calls.
 
@@ -384,5 +501,7 @@ void Patch_FOVScale(PPCRegister& f1, PPCRegister& r24) {}
 void MCLACameraPosSmoothing(PPCRegister& f13) {}
 void MCLACameraLookAtSmoothing(PPCRegister& f0) {}
 void MCLACameraShakeFilter(PPCRegister& f31, PPCRegister& f30, PPCRegister& f29, PPCRegister& f0, PPCRegister& r1) {}
+void MCLACameraTransitionSmoothing(PPCRegister& r27, PPCRegister& r26, PPCRegister& r4, PPCRegister& r1) {}
+void MCLACameraTransitionComplete(PPCRegister& r3) {}
 #endif // REXGLUE_HAS_XEO3_TARGET
 

@@ -77,6 +77,8 @@ void Hook_PhotoModeCapture(PPCRegister& r3);
 void MCLACameraPosSmoothing(PPCRegister& f13);
 void MCLACameraLookAtSmoothing(PPCRegister& f0);
 void MCLACameraShakeFilter(PPCRegister& f31, PPCRegister& f30, PPCRegister& f29, PPCRegister& f0, PPCRegister& r1);
+void MCLACameraTransitionSmoothing(PPCRegister& r27, PPCRegister& r26, PPCRegister& r4, PPCRegister& r1);
+void MCLACameraTransitionComplete(PPCRegister& r3);
 void MCLAChassisDepthSmoothing(PPCRegister& f0);
 void MCLAChassisGroundPushbackDamper(PPCRegister& f0, PPCRegister& f3);
 void MCLAChassisPushbackAccel(PPCRegister& f1);
