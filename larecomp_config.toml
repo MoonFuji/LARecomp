@@ -25905,14 +25905,23 @@ name = "MCLACameraLookAtSmoothing"
 address = 0x823204F4
 registers = ["f0"]
 
-# BadassBaboon's Recomp Adjustments: Continuous 30Hz low-pass filter on camera shake noise
+# BadassBaboon's Recomp Adjustments: Continuous 8Hz low-pass filter on camera shake noise
 # 0x82315188: lfs f29, 0x200+var_190(r1) in sub_82315000 (after rotational angles loaded).
 # Low-pass filters high-frequency PRNG chatter while preserving full-amplitude physical harmonic shake.
 [[midasm_hook]]
 name = "MCLACameraShakeFilter"
 address = 0x82315188
 after_instruction = true
-registers = ["f31", "f30", "f29", "r28", "r1"]
+registers = ["f31", "f30", "f29", "f0", "r28", "r1"]
+
+# BadassBaboon's Recomp Adjustments: Continuous vehicle-relative target camera tracking during active transitions
+# 0x8271F46C: lfs f0, 0xD4(r27) in sub_8271F438 (cameraTransition::Update).
+# Synchronizes destination chase camera with moving vehicle during active transitions.
+[[midasm_hook]]
+name = "MCLACameraTransitionLiveSync"
+address = 0x8271F46C
+after_instruction = true
+registers = ["r27"]
 
 # BadassBaboon's Recomp Adjustments: Lookaround & camera boom gimbal continuous-time exponential smoothing
 # 0x822B30A4: lfs f31, 0x30(r10) in sub_822B2AB0 (mcPlayerCamera update).
