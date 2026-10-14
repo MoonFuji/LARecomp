@@ -25905,14 +25905,14 @@ name = "MCLACameraLookAtSmoothing"
 address = 0x823204F4
 registers = ["f0"]
 
-# BadassBaboon's Recomp Adjustments: Camera shake amplitude scaling for high and uncapped framerates
-# 0x823150C8: fmuls f31, f12, f11 in sub_82315000 (channel shake amplitude evaluation).
-# Scales the white noise angular and positional displacements by (60 * dt) when dt < 1/60s.
+# BadassBaboon's Recomp Adjustments: Continuous 30Hz low-pass filter on camera shake noise
+# 0x82315188: lfs f29, 0x200+var_190(r1) in sub_82315000 (after rotational angles loaded).
+# Low-pass filters high-frequency PRNG chatter while preserving full-amplitude physical harmonic shake.
 [[midasm_hook]]
-name = "MCLACameraShakeScaling"
-address = 0x823150C8
+name = "MCLACameraShakeFilter"
+address = 0x82315188
 after_instruction = true
-registers = ["f31"]
+registers = ["f31", "f30", "f29", "r28", "r1"]
 
 # BadassBaboon's Recomp Adjustments: Lookaround & camera boom gimbal continuous-time exponential smoothing
 # 0x822B30A4: lfs f31, 0x30(r10) in sub_822B2AB0 (mcPlayerCamera update).
@@ -25932,14 +25932,50 @@ address = 0x822B30AC
 after_instruction = true
 registers = ["f0"]
 
-# BadassBaboon's Recomp Adjustments: Camera transition & intro orbit Quaternion SLERP stabilization
-# 0x8271F920: bl sub_821B9B28 in sub_8271F438 (camTransition::Update).
-# Replaces Euler ZXY angle decomposition with shortest-path Quaternion SLERP on SO(3).
+# BadassBaboon's Recomp Adjustments: Orbit / intro camera shortest-path Euler unwrapping (primary target)
+# 0x8232261C: bl sub_82204D68 in sub_823224E0 (camTrackCS / mcCinematicCS update).
+# Wraps target Euler angles at r1+0x50 relative to current angles at r1+0x70 to [-pi, +pi].
 [[midasm_hook]]
-name = "MCLACameraTransitionSlerp"
-address = 0x8271F920
+name = "MCLATrackEulerShortestPath1"
+address = 0x8232261C
 after_instruction = true
-registers = ["r31", "r1", "r26"]
+registers = ["r1"]
+
+# BadassBaboon's Recomp Adjustments: Orbit / intro camera shortest-path Euler unwrapping (secondary blend target)
+# 0x82322744: bl sub_82204D68 in sub_823224E0 (camTrackCS / mcCinematicCS update).
+# Wraps secondary target Euler angles at r1+0x60 relative to current angles at r1+0x70 to [-pi, +pi].
+[[midasm_hook]]
+name = "MCLATrackEulerShortestPath2"
+address = 0x82322744
+after_instruction = true
+registers = ["r1"]
+
+# BadassBaboon's Recomp Adjustments: Tracker velocity rate-limiter continuous-time exponential scaling
+# 0x82322444: lfs f10, 0x118(r3) in sub_823223E8.
+# Converts raw 30 FPS filter retention factor (0.7) to continuous-time decay: 1 - (1 - k)^(30 * dt).
+[[midasm_hook]]
+name = "MCLATrackerRateSmoothing"
+address = 0x82322444
+after_instruction = true
+registers = ["f10"]
+
+# BadassBaboon's Recomp Adjustments: Camera boom collision zoom distance continuous-time damping
+# 0x8231C320: lfs f0, flt_8200FEB4@l(r11) in sub_8231B740 (site 1).
+# Converts raw 30 FPS zoom lerp factor (0.3) to continuous-time decay: 1 - (1 - 0.3)^(30 * dt).
+[[midasm_hook]]
+name = "MCLACameraBoomZoomDamping1"
+address = 0x8231C320
+after_instruction = true
+registers = ["f0"]
+
+# 0x8231C3A0: lfs f0, flt_8200FEB4@l(r10) in sub_8231B740 (site 2).
+# Converts raw 30 FPS zoom lerp factor (0.3) to continuous-time decay: 1 - (1 - 0.3)^(30 * dt).
+[[midasm_hook]]
+name = "MCLACameraBoomZoomDamping2"
+address = 0x8231C3A0
+after_instruction = true
+registers = ["f0"]
+
 
 # BadassBaboon's Recomp Adjustments: Vehicle chassis suspension damping & ground depth filter continuous-time scaling
 # 0x82563720: lis r11, flt_82001D14@ha in sub_82563298.

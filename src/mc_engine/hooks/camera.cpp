@@ -44,9 +44,9 @@ REXCVAR_DEFINE_DOUBLE(chase_cam_smoothing_factor, 1.0, "MCLA/Camera",
     .range(0.1, 3.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-// BadassBaboon's Recomp Adjustments: Camera shake scaling for high framerates and intensity tuning
+// BadassBaboon's Recomp Adjustments: Continuous-time camera shake noise filtering & scaling
 REXCVAR_DEFINE_BOOL(scale_camera_shake, true, "MCLA/Camera",
-    "Fix: Scale camera shake amplitude with framerate (60+ FPS) to prevent violent noise jitter during drifts, burnouts, and crashes.")
+    "Fix: Filter camera shake noise with continuous 30Hz low-pass filter across framerates (60+ FPS) to prevent violent noise jitter during drifts, burnouts, and crashes.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_DOUBLE(camera_shake_scale, 1.0, "MCLA/Camera",
@@ -54,14 +54,29 @@ REXCVAR_DEFINE_DOUBLE(camera_shake_scale, 1.0, "MCLA/Camera",
     .range(0.0, 3.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-// BadassBaboon's Recomp Adjustments: Continuous-time camera boom gimbal smoothing
-REXCVAR_DEFINE_BOOL(smooth_camera_gimbal, true, "MCLA/Camera",
-    "Fix: Smooth camera boom gimbal / orbit rotation using continuous-time exponential decay across high framerates.")
+REXCVAR_DEFINE_DOUBLE(camera_shake_smoothing, 1.0, "MCLA/Camera",
+    "Camera shake low-pass filter strength (0.1 = heavy smoothing, 1.0 = physical 30Hz rumble, 3.0 = sharper).")
+    .range(0.1, 5.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-// BadassBaboon's Recomp Adjustments: Camera transition / intro orbit Quaternion SLERP stabilization
-REXCVAR_DEFINE_BOOL(smooth_camera_transition, true, "MCLA/Camera",
-    "Fix: Stabilize camera transition and race intro orbit interpolation using Quaternion SLERP instead of Euler angles.")
+// BadassBaboon's Recomp Adjustments: Continuous-time camera boom gimbal smoothing
+REXCVAR_DEFINE_BOOL(smooth_camera_gimbal, true, "MCLA/Camera",
+    "Fix: Smooth camera boom gimbal / lookaround rotation using continuous-time exponential decay across high framerates.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_DOUBLE(camera_gimbal_sensitivity, 1.0, "MCLA/Camera",
+    "Camera lookaround / gimbal responsiveness multiplier (0.5 = softer, 1.0 = normal, 2.0 = snappier).")
+    .range(0.2, 5.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// BadassBaboon's Recomp Adjustments: Orbit / intro camera & tracker rate stabilization
+REXCVAR_DEFINE_BOOL(smooth_track_camera, true, "MCLA/Camera",
+    "Fix: Stabilize orbit and race intro track camera using shortest-arc Euler unwrapping and continuous-time rate smoothing.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// BadassBaboon's Recomp Adjustments: Camera boom collision zoom damping
+REXCVAR_DEFINE_BOOL(smooth_boom_zoom, true, "MCLA/Camera",
+    "Fix: Continuous-time damping on camera boom collision zoom to eliminate erratic camera pumping near walls and barriers.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_STRING(debug_cam, "off", "MCLA/Camera",
@@ -356,14 +371,21 @@ void MCLACameraLookAtSmoothing(PPCRegister& f0) {
     ApplyCameraSmoothing(f0);
 }
 
-// BadassBaboon's Recomp Adjustments: Camera shake amplitude scaling for high and uncapped framerates
-// In sub_82315000:
-// The engine evaluates channel amplitude (f31 = amp * intensity * envelope), then steps
-// the LCG PRNG (qword_82860880) each frame and injects discrete white noise angle/position kicks.
-// Without time scaling, noise frequency and RMS angular velocity scale directly with FPS,
-// transforming low-frequency rumble into violent buzzing/vibrating at 100+ FPS.
-// Scaling amplitude by min(1.0, 60.0 * dt) keeps the perceived angular velocity invariant.
-void MCLACameraShakeScaling(PPCRegister& f31) {
+// BadassBaboon's Recomp Adjustments: Continuous 30Hz low-pass filter on camera shake noise
+// In sub_82315000 at 0x82315188:
+// The engine evaluates harmonic wave oscillations and discrete white noise from an LCG PRNG.
+// Low-pass filtering the rotational displacements at ~30 Hz preserves the large, physical
+// rumble of crashes, burnouts, and drifting while completely eliminating high-frequency
+// (100-240 Hz) buzzing and screen vibration at high framerates.
+struct ShakeChannelState {
+    uint32_t channel_ptr = 0;
+    double pitch = 0.0;
+    double roll = 0.0;
+    double yaw = 0.0;
+};
+static ShakeChannelState s_shake_channels[8];
+
+void MCLACameraShakeFilter(PPCRegister& f31, PPCRegister& f30, PPCRegister& f29, PPCRegister& r28, PPCRegister& r1) {
     if (!REXCVAR_GET(scale_camera_shake)) return;
 
     auto* base = rex::Runtime::instance()->virtual_membase();
@@ -372,17 +394,77 @@ void MCLACameraShakeScaling(PPCRegister& f31) {
     const float dt = ReadGuestF32(base, kGuestFrameDelta);
     if (dt <= 0.0f) return;
 
-    const double fps_scale = (dt < (1.0f / 60.0f)) ? (static_cast<double>(dt) * 60.0) : 1.0;
+    const uint32_t chan_ptr = static_cast<uint32_t>(r28.u64);
+    const uint32_t sp = static_cast<uint32_t>(r1.u64);
+
+    int slot = -1;
+    for (int i = 0; i < 8; ++i) {
+        if (s_shake_channels[i].channel_ptr == chan_ptr) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot == -1) {
+        for (int i = 0; i < 8; ++i) {
+            if (s_shake_channels[i].channel_ptr == 0) {
+                s_shake_channels[i].channel_ptr = chan_ptr;
+                slot = i;
+                break;
+            }
+        }
+    }
+    if (slot == -1) {
+        slot = 0;
+    }
+
+    ShakeChannelState& st = s_shake_channels[slot];
+
+    const double raw_pitch = f31.f64;
+    const double raw_roll  = f30.f64;
+    const double raw_yaw   = f29.f64;
+
+    if (std::abs(raw_pitch) < 1e-7 && std::abs(raw_roll) < 1e-7 && std::abs(raw_yaw) < 1e-7) {
+        st.pitch = 0.0;
+        st.roll  = 0.0;
+        st.yaw   = 0.0;
+        f31.f64 = 0.0;
+        f30.f64 = 0.0;
+        f29.f64 = 0.0;
+        if (sp) {
+            WriteGuestF32(base, sp + 0x78, 0.0f);
+            WriteGuestF32(base, sp + 0x74, 0.0f);
+            WriteGuestF32(base, sp + 0x70, 0.0f);
+        }
+        return;
+    }
+
+    const double filter_mult = REXCVAR_GET(camera_shake_smoothing);
+    double alpha = 1.0 - std::exp(-30.0 * filter_mult * static_cast<double>(dt));
+    if (alpha > 1.0) alpha = 1.0;
+    if (alpha < 0.01) alpha = 0.01;
+
+    st.pitch += alpha * (raw_pitch - st.pitch);
+    st.roll  += alpha * (raw_roll  - st.roll);
+    st.yaw   += alpha * (raw_yaw   - st.yaw);
+
     const double user_scale = REXCVAR_GET(camera_shake_scale);
-    f31.f64 *= fps_scale * user_scale;
+    f31.f64 = st.pitch * user_scale;
+    f30.f64 = st.roll  * user_scale;
+    f29.f64 = st.yaw   * user_scale;
+
+    if (sp) {
+        WriteGuestF32(base, sp + 0x78, static_cast<float>(f31.f64));
+        WriteGuestF32(base, sp + 0x74, static_cast<float>(f30.f64));
+        WriteGuestF32(base, sp + 0x70, static_cast<float>(f29.f64));
+    }
 }
 
 // BadassBaboon's Recomp Adjustments: Lookaround & camera boom gimbal continuous-time exponential smoothing
 // In sub_822B2AB0 (mcPlayerCamera update at 0x822B30A4):
 // f31 is the raw per-frame LookaroundLerpFactor k0 (tune+48).
 // Converting to continuous-time exponential retention:
-//   k(dt) = 1.0 - (1.0 - k0)^(60 * dt)
-// keeps gimbal response and orbit rotation speed perfectly uniform across framerates.
+//   k(dt) = 1.0 - (1.0 - k0)^(30 * dt * sens)
+// preserves responsive right-stick lookaround and prevents sluggish gimbal lag at high FPS.
 void MCLACameraGimbalSmoothing(PPCRegister& f31) {
     if (!REXCVAR_GET(smooth_camera_gimbal)) return;
 
@@ -393,7 +475,8 @@ void MCLACameraGimbalSmoothing(PPCRegister& f31) {
     const double raw_k = f31.f64;
     if (raw_k <= 0.0 || raw_k >= 1.0 || dt <= 0.0f) return;
 
-    f31.f64 = 1.0 - std::pow(1.0 - raw_k, static_cast<double>(dt) * 60.0);
+    const double sens = REXCVAR_GET(camera_gimbal_sensitivity);
+    f31.f64 = 1.0 - std::pow(1.0 - raw_k, static_cast<double>(dt) * 30.0 * sens);
 }
 
 // BadassBaboon's Recomp Adjustments: Lookaround yaw shortest-path angular delta
@@ -408,190 +491,91 @@ void MCLACameraYawShortestPath(PPCRegister& f0) {
     f0.f64 = d;
 }
 
-// -----------------------------------------------------------------------------------------
-// Quaternion Math for Camera Transition SLERP Stabilization
-// -----------------------------------------------------------------------------------------
-namespace {
+// BadassBaboon's Recomp Adjustments: Orbit / intro camera shortest-path Euler unwrapping
+// In sub_823224E0 (camTrackCS / mcCinematicCS update):
+// Shortest-path unwraps target Euler angles relative to reference angles into [-pi, +pi].
+// Eliminates 360-degree camera flips, jerks, and seam snapping during circular orbits around the car.
+static void UnwrapEulerDelta(uint8_t* base, uint32_t sp, uint32_t ref_offset, uint32_t tgt_offset) {
+    constexpr double kPi = 3.14159265358979323846;
+    constexpr double kTwoPi = 6.28318530717958647692;
 
-struct Quat {
-    float x = 0.0f;
-    float y = 0.0f;
-    float z = 0.0f;
-    float w = 1.0f;
-};
+    for (int i = 0; i < 3; ++i) {
+        const float ref_val = ReadGuestF32(base, sp + ref_offset + i * 4);
+        const float tgt_val = ReadGuestF32(base, sp + tgt_offset + i * 4);
 
-// Shepperd's algorithm for converting 3x3 orthonormal row vectors to a unit quaternion
-static Quat MatrixToQuat(const float r0[3], const float r1[3], const float r2[3]) {
-    const float trace = r0[0] + r1[1] + r2[2];
-    Quat q;
-    if (trace > 0.0f) {
-        float s = 0.5f / std::sqrt(trace + 1.0f);
-        q.w = 0.25f / s;
-        q.x = (r1[2] - r2[1]) * s;
-        q.y = (r2[0] - r0[2]) * s;
-        q.z = (r0[1] - r1[0]) * s;
-    } else {
-        if (r0[0] > r1[1] && r0[0] > r2[2]) {
-            float s = 2.0f * std::sqrt(std::max(0.0f, 1.0f + r0[0] - r1[1] - r2[2]));
-            if (s < 1e-6f) s = 1e-6f;
-            q.w = (r1[2] - r2[1]) / s;
-            q.x = 0.25f * s;
-            q.y = (r0[1] + r1[0]) / s;
-            q.z = (r0[2] + r2[0]) / s;
-        } else if (r1[1] > r2[2]) {
-            float s = 2.0f * std::sqrt(std::max(0.0f, 1.0f + r1[1] - r0[0] - r2[2]));
-            if (s < 1e-6f) s = 1e-6f;
-            q.w = (r2[0] - r0[2]) / s;
-            q.x = (r0[1] + r1[0]) / s;
-            q.y = 0.25f * s;
-            q.z = (r1[2] + r2[1]) / s;
-        } else {
-            float s = 2.0f * std::sqrt(std::max(0.0f, 1.0f + r2[2] - r0[0] - r1[1]));
-            if (s < 1e-6f) s = 1e-6f;
-            q.w = (r0[1] - r1[0]) / s;
-            q.x = (r0[2] + r2[0]) / s;
-            q.y = (r1[2] + r2[1]) / s;
-            q.z = 0.25f * s;
-        }
+        double diff = static_cast<double>(tgt_val) - static_cast<double>(ref_val);
+        while (diff > kPi) diff -= kTwoPi;
+        while (diff < -kPi) diff += kTwoPi;
+
+        WriteGuestF32(base, sp + tgt_offset + i * 4, static_cast<float>(static_cast<double>(ref_val) + diff));
     }
-    const float len = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
-    if (len > 1e-6f) {
-        q.x /= len; q.y /= len; q.z /= len; q.w /= len;
-    } else {
-        q = {0.0f, 0.0f, 0.0f, 1.0f};
-    }
-    return q;
 }
 
-// Spherical Linear Interpolation (SLERP) along geodesic shortest path
-static Quat QuatSlerp(Quat q1, Quat q2, float t) {
-    float dot = q1.x * q2.x + q1.y * q2.y + q1.z * q2.z + q1.w * q2.w;
-    if (dot < 0.0f) {
-        q2.x = -q2.x; q2.y = -q2.y; q2.z = -q2.z; q2.w = -q2.w;
-        dot = -dot;
-    }
-    if (dot > 0.9995f) {
-        Quat res = {
-            q1.x + t * (q2.x - q1.x),
-            q1.y + t * (q2.y - q1.y),
-            q1.z + t * (q2.z - q1.z),
-            q1.w + t * (q2.w - q1.w)
-        };
-        const float len = std::sqrt(res.x * res.x + res.y * res.y + res.z * res.z + res.w * res.w);
-        if (len > 1e-6f) {
-            res.x /= len; res.y /= len; res.z /= len; res.w /= len;
-        }
-        return res;
-    }
-    const float theta_0 = std::acos(std::min(1.0f, std::max(-1.0f, dot)));
-    const float theta = theta_0 * t;
-    const float sin_theta = std::sin(theta);
-    const float sin_theta_0 = std::sin(theta_0);
-    const float s1 = std::cos(theta) - dot * sin_theta / sin_theta_0;
-    const float s2 = sin_theta / sin_theta_0;
-    return {
-        s1 * q1.x + s2 * q2.x,
-        s1 * q1.y + s2 * q2.y,
-        s1 * q1.z + s2 * q2.z,
-        s1 * q1.w + s2 * q2.w
-    };
-}
-
-static void QuatToMatrix(const Quat& q, float r0[3], float r1[3], float r2[3]) {
-    const float xx = q.x * q.x, yy = q.y * q.y, zz = q.z * q.z;
-    const float xy = q.x * q.y, xz = q.x * q.z, yz = q.y * q.z;
-    const float wx = q.w * q.x, wy = q.w * q.y, wz = q.w * q.z;
-
-    r0[0] = 1.0f - 2.0f * (yy + zz);
-    r0[1] = 2.0f * (xy + wz);
-    r0[2] = 2.0f * (xz - wy);
-
-    r1[0] = 2.0f * (xy - wz);
-    r1[1] = 1.0f - 2.0f * (xx + zz);
-    r1[2] = 2.0f * (yz + wx);
-
-    r2[0] = 2.0f * (xz + wy);
-    r2[1] = 2.0f * (yz - wx);
-    r2[2] = 1.0f - 2.0f * (xx + yy);
-}
-
-} // anonymous namespace
-
-// BadassBaboon's Recomp Adjustments: Camera transition & intro orbit Quaternion SLERP stabilization
-// In sub_8271F438 (camTransition::Update at 0x8271F920):
-// Replaces the native Euler ZXY angle decomposition and linear angle blend with Quaternion SLERP.
-// Eliminates gimbal lock singularities, polar angle sign flips, and camera position wobbles.
-void MCLACameraTransitionSlerp(PPCRegister& r31, PPCRegister& r1, PPCRegister& r26) {
-    if (!REXCVAR_GET(smooth_camera_transition)) return;
+void MCLATrackEulerShortestPath1(PPCRegister& r1) {
+    if (!REXCVAR_GET(smooth_track_camera)) return;
 
     auto* base = rex::Runtime::instance()->virtual_membase();
     if (!base) return;
 
-    const uint32_t out_addr = static_cast<uint32_t>(r31.u64);
     const uint32_t sp = static_cast<uint32_t>(r1.u64);
-    const uint32_t t_ptr = static_cast<uint32_t>(r26.u64);
-    if (!out_addr || !sp || !t_ptr) return;
+    if (!sp) return;
 
-    float t = ReadGuestF32(base, t_ptr);
-    if (t < 0.0f) t = 0.0f;
-    if (t > 1.0f) t = 1.0f;
+    UnwrapEulerDelta(base, sp, 0x70, 0x50);
+}
 
-    // Source camera 3x3 orientation from stack (r1 + 0x80, 0x90, 0xA0)
-    const float src_r0[3] = {
-        ReadGuestF32(base, sp + 0x80),
-        ReadGuestF32(base, sp + 0x84),
-        ReadGuestF32(base, sp + 0x88)
-    };
-    const float src_r1[3] = {
-        ReadGuestF32(base, sp + 0x90),
-        ReadGuestF32(base, sp + 0x94),
-        ReadGuestF32(base, sp + 0x98)
-    };
-    const float src_r2[3] = {
-        ReadGuestF32(base, sp + 0xA0),
-        ReadGuestF32(base, sp + 0xA4),
-        ReadGuestF32(base, sp + 0xA8)
-    };
+void MCLATrackEulerShortestPath2(PPCRegister& r1) {
+    if (!REXCVAR_GET(smooth_track_camera)) return;
 
-    // Target camera 3x3 orientation from stack (r1 + 0xC0, 0xD0, 0xE0)
-    const float tgt_r0[3] = {
-        ReadGuestF32(base, sp + 0xC0),
-        ReadGuestF32(base, sp + 0xC4),
-        ReadGuestF32(base, sp + 0xC8)
-    };
-    const float tgt_r1[3] = {
-        ReadGuestF32(base, sp + 0xD0),
-        ReadGuestF32(base, sp + 0xD4),
-        ReadGuestF32(base, sp + 0xD8)
-    };
-    const float tgt_r2[3] = {
-        ReadGuestF32(base, sp + 0xE0),
-        ReadGuestF32(base, sp + 0xE4),
-        ReadGuestF32(base, sp + 0xE8)
-    };
+    auto* base = rex::Runtime::instance()->virtual_membase();
+    if (!base) return;
 
-    const float src_len2 = src_r0[0] * src_r0[0] + src_r0[1] * src_r0[1] + src_r0[2] * src_r0[2];
-    const float tgt_len2 = tgt_r0[0] * tgt_r0[0] + tgt_r0[1] * tgt_r0[1] + tgt_r0[2] * tgt_r0[2];
-    if (src_len2 < 0.1f || tgt_len2 < 0.1f) return;
+    const uint32_t sp = static_cast<uint32_t>(r1.u64);
+    if (!sp) return;
 
-    const Quat q_src = MatrixToQuat(src_r0, src_r1, src_r2);
-    const Quat q_tgt = MatrixToQuat(tgt_r0, tgt_r1, tgt_r2);
-    const Quat q_interp = QuatSlerp(q_src, q_tgt, t);
+    UnwrapEulerDelta(base, sp, 0x70, 0x60);
+}
 
-    float out_r0[3], out_r1[3], out_r2[3];
-    QuatToMatrix(q_interp, out_r0, out_r1, out_r2);
+// BadassBaboon's Recomp Adjustments: Tracker velocity rate-limiter continuous-time exponential scaling
+// In sub_823223E8 at 0x82322444:
+// Converts raw 30 FPS filter retention factor (0.7 at a1+280) to continuous-time exponential decay:
+//   k(dt) = 1 - (1 - k)^(30 * dt)
+// Ensures the velocity history filter retains identical physical damping at 60, 120, and 240 FPS.
+void MCLATrackerRateSmoothing(PPCRegister& f10) {
+    if (!REXCVAR_GET(smooth_track_camera)) return;
 
-    WriteGuestF32(base, out_addr + 0x00, out_r0[0]);
-    WriteGuestF32(base, out_addr + 0x04, out_r0[1]);
-    WriteGuestF32(base, out_addr + 0x08, out_r0[2]);
+    auto* base = rex::Runtime::instance()->virtual_membase();
+    if (!base) return;
 
-    WriteGuestF32(base, out_addr + 0x10, out_r1[0]);
-    WriteGuestF32(base, out_addr + 0x14, out_r1[1]);
-    WriteGuestF32(base, out_addr + 0x18, out_r1[2]);
+    const float dt = ReadGuestF32(base, kGuestFrameDelta);
+    const double raw_k = f10.f64;
+    if (raw_k <= 0.0 || raw_k >= 1.0 || dt <= 0.0f) return;
 
-    WriteGuestF32(base, out_addr + 0x20, out_r2[0]);
-    WriteGuestF32(base, out_addr + 0x24, out_r2[1]);
-    WriteGuestF32(base, out_addr + 0x28, out_r2[2]);
+    f10.f64 = 1.0 - std::pow(1.0 - raw_k, static_cast<double>(dt) * 30.0);
+}
+
+// BadassBaboon's Recomp Adjustments: Camera boom collision zoom distance continuous-time damping
+// In sub_8231B740 at 0x8231C320 and 0x8231C3A0:
+// Converts raw 30 FPS boom collision distance lerp factor (0.3) to continuous-time exponential decay.
+// Eliminates rapid zoom pumping and snapping when driving near walls, light poles, or barriers.
+static void ApplyBoomZoomDamping(PPCRegister& f0) {
+    if (!REXCVAR_GET(smooth_boom_zoom)) return;
+
+    auto* base = rex::Runtime::instance()->virtual_membase();
+    if (!base) return;
+
+    const float dt = ReadGuestF32(base, kGuestFrameDelta);
+    const double raw_k = f0.f64;
+    if (raw_k <= 0.0 || raw_k >= 1.0 || dt <= 0.0f) return;
+
+    f0.f64 = 1.0 - std::pow(1.0 - raw_k, static_cast<double>(dt) * 30.0);
+}
+
+void MCLACameraBoomZoomDamping1(PPCRegister& f0) {
+    ApplyBoomZoomDamping(f0);
+}
+
+void MCLACameraBoomZoomDamping2(PPCRegister& f0) {
+    ApplyBoomZoomDamping(f0);
 }
 #else // REXGLUE_HAS_XEO3_TARGET
 // XEO3 stubs: empty implementations so the linker resolves codegen calls.
@@ -603,8 +587,12 @@ void Patch_DebugCam(PPCRegister& r3) {}
 void Patch_FOVScale(PPCRegister& f1, PPCRegister& r24) {}
 void MCLACameraPosSmoothing(PPCRegister& f13) {}
 void MCLACameraLookAtSmoothing(PPCRegister& f0) {}
-void MCLACameraShakeScaling(PPCRegister& f31) {}
+void MCLACameraShakeFilter(PPCRegister& f31, PPCRegister& f30, PPCRegister& f29, PPCRegister& r28, PPCRegister& r1) {}
 void MCLACameraGimbalSmoothing(PPCRegister& f31) {}
 void MCLACameraYawShortestPath(PPCRegister& f0) {}
-void MCLACameraTransitionSlerp(PPCRegister& r31, PPCRegister& r1, PPCRegister& r26) {}
+void MCLATrackEulerShortestPath1(PPCRegister& r1) {}
+void MCLATrackEulerShortestPath2(PPCRegister& r1) {}
+void MCLATrackerRateSmoothing(PPCRegister& f10) {}
+void MCLACameraBoomZoomDamping1(PPCRegister& f0) {}
+void MCLACameraBoomZoomDamping2(PPCRegister& f0) {}
 #endif // REXGLUE_HAS_XEO3_TARGET
