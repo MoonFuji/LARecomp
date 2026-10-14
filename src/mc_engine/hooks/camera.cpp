@@ -44,44 +44,14 @@ REXCVAR_DEFINE_DOUBLE(chase_cam_smoothing_factor, 1.0, "MCLA/Camera",
     .range(0.1, 3.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-// BadassBaboon's Recomp Adjustments: Continuous-time camera shake noise filtering & scaling
+// BadassBaboon's Recomp Adjustments: Continuous-time camera shake scaling
 REXCVAR_DEFINE_BOOL(scale_camera_shake, true, "MCLA/Camera",
-    "Fix: Filter camera shake noise with continuous 30Hz low-pass filter across framerates (60+ FPS) to prevent violent noise jitter during drifts, burnouts, and crashes.")
+    "Fix: Scale camera shake intensity across framerates (60+ FPS) to prevent violent noise jitter during drifts, burnouts, and crashes.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_DOUBLE(camera_shake_scale, 0.6, "MCLA/Camera",
     "Camera shake intensity multiplier (0.0 = disabled, 0.6 = balanced PC rumble, 1.0 = full console shake).")
     .range(0.0, 3.0)
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-
-REXCVAR_DEFINE_DOUBLE(camera_shake_smoothing, 1.0, "MCLA/Camera",
-    "Camera shake low-pass filter strength (0.5 = heavier smoothing, 1.0 = 8Hz cinematic rumble, 2.0 = sharper).")
-    .range(0.1, 5.0)
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-
-// BadassBaboon's Recomp Adjustments: Continuous vehicle-relative target camera tracking during active transitions
-REXCVAR_DEFINE_BOOL(smooth_camera_transitions, true, "MCLA/Camera",
-    "Fix: Synchronize destination camera with moving vehicle during active transitions (boot-to-car, race countdown, race finish) to eliminate transition camera lag, stretching, and handover snap.")
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-
-// BadassBaboon's Recomp Adjustments: Continuous-time camera boom gimbal smoothing
-REXCVAR_DEFINE_BOOL(smooth_camera_gimbal, true, "MCLA/Camera",
-    "Fix: Smooth camera boom gimbal / lookaround rotation using continuous-time exponential decay across high framerates.")
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-
-REXCVAR_DEFINE_DOUBLE(camera_gimbal_sensitivity, 1.0, "MCLA/Camera",
-    "Camera lookaround / gimbal responsiveness multiplier (0.5 = softer, 1.0 = normal, 2.0 = snappier).")
-    .range(0.2, 5.0)
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-
-// BadassBaboon's Recomp Adjustments: Orbit / intro camera & tracker rate stabilization
-REXCVAR_DEFINE_BOOL(smooth_track_camera, true, "MCLA/Camera",
-    "Fix: Stabilize orbit and race intro track camera using shortest-arc Euler unwrapping and continuous-time rate smoothing.")
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-
-// BadassBaboon's Recomp Adjustments: Camera boom collision zoom damping
-REXCVAR_DEFINE_BOOL(smooth_boom_zoom, true, "MCLA/Camera",
-    "Fix: Continuous-time damping on camera boom collision zoom to eliminate erratic camera pumping near walls and barriers.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_STRING(debug_cam, "off", "MCLA/Camera",
@@ -376,386 +346,32 @@ void MCLACameraLookAtSmoothing(PPCRegister& f0) {
     ApplyCameraSmoothing(f0);
 }
 
-// BadassBaboon's Recomp Adjustments: Continuous 30Hz low-pass filter on camera shake noise
+// BadassBaboon's Recomp Adjustments: Continuous-time camera shake scaling
 // In sub_82315000 at 0x82315188:
 // The engine evaluates harmonic wave oscillations and discrete white noise from an LCG PRNG.
-// Low-pass filtering the rotational displacements at ~30 Hz preserves the large, physical
-// rumble of crashes, burnouts, and drifting while completely eliminating high-frequency
-// (100-240 Hz) buzzing and screen vibration at high framerates.
-struct ShakeChannelState {
-    uint32_t channel_ptr = 0;
-    double pitch = 0.0;
-    double roll = 0.0;
-    double yaw = 0.0;
-};
-static ShakeChannelState s_shake_channels[8];
-
-void MCLACameraShakeFilter(PPCRegister& f31, PPCRegister& f30, PPCRegister& f29, PPCRegister& f0, PPCRegister& r28, PPCRegister& r1) {
+// Scaling rotational shake displacements (f29 pitch, f30 roll, f31 yaw) eliminates excessive
+// high-frequency chatter at high framerates (60, 120, 240 FPS) while maintaining 100% natural
+// camera orientation and responsive feel.
+void MCLACameraShakeFilter(PPCRegister& f31, PPCRegister& f30, PPCRegister& f29, PPCRegister& f0, PPCRegister& r1) {
     if (!REXCVAR_GET(scale_camera_shake)) return;
+
+    const double user_scale = REXCVAR_GET(camera_shake_scale);
+    if (user_scale == 1.0) return;
 
     auto* base = rex::Runtime::instance()->virtual_membase();
     if (!base) return;
 
-    const float dt = ReadGuestF32(base, kGuestFrameDelta);
-    if (dt <= 0.0f) return;
-
-    const uint32_t chan_ptr = static_cast<uint32_t>(r28.u64);
-    const uint32_t sp = static_cast<uint32_t>(r1.u64);
-
-    int slot = -1;
-    for (int i = 0; i < 8; ++i) {
-        if (s_shake_channels[i].channel_ptr == chan_ptr) {
-            slot = i;
-            break;
-        }
-    }
-    if (slot == -1) {
-        for (int i = 0; i < 8; ++i) {
-            if (s_shake_channels[i].channel_ptr == 0) {
-                s_shake_channels[i].channel_ptr = chan_ptr;
-                slot = i;
-                break;
-            }
-        }
-    }
-    if (slot == -1) {
-        slot = 0;
-    }
-
-    ShakeChannelState& st = s_shake_channels[slot];
-
-    // In sub_82315000:
-    // f29 is Pitch (from sp + 0x70, rotated by sub_82227DE0 around X axis)
-    // f30 is Roll  (from sp + 0x74, rotated by sub_82204CB8 around Z axis)
-    // f31 is Yaw   (from sp + 0x78, rotated by sub_82227E98 around Y axis)
-    const double raw_pitch = f29.f64;
-    const double raw_roll  = f30.f64;
-    const double raw_yaw   = f31.f64;
-
-    if (std::abs(raw_pitch) < 1e-7 && std::abs(raw_roll) < 1e-7 && std::abs(raw_yaw) < 1e-7) {
-        st.pitch = 0.0;
-        st.roll  = 0.0;
-        st.yaw   = 0.0;
-        f29.f64 = 0.0;
-        f30.f64 = 0.0;
-        f31.f64 = 0.0;
-        f0.f64  = 0.0;
-        if (sp) {
-            WriteGuestF32(base, sp + 0x70, 0.0f);
-            WriteGuestF32(base, sp + 0x74, 0.0f);
-            WriteGuestF32(base, sp + 0x78, 0.0f);
-        }
-        return;
-    }
-
-    const double filter_mult = REXCVAR_GET(camera_shake_smoothing);
-    // Baseline 8 Hz cutoff creates deep, physical vehicle chassis rumble
-    // and eliminates hyper-fast PRNG buzzing noise across framerates (60, 120, 240 FPS).
-    double alpha = 1.0 - std::exp(-8.0 * filter_mult * static_cast<double>(dt));
-    if (alpha > 1.0) alpha = 1.0;
-    if (alpha < 0.01) alpha = 0.01;
-
-    st.pitch += alpha * (raw_pitch - st.pitch);
-    st.roll  += alpha * (raw_roll  - st.roll);
-    st.yaw   += alpha * (raw_yaw   - st.yaw);
-
-    const double user_scale = REXCVAR_GET(camera_shake_scale);
-    f29.f64 = st.pitch * user_scale;
-    f30.f64 = st.roll  * user_scale;
-    f31.f64 = st.yaw   * user_scale;
-
-    // Update f0 = f31^2 so downstream vector magnitude calculation reflects filtered yaw
+    f29.f64 *= user_scale;
+    f30.f64 *= user_scale;
+    f31.f64 *= user_scale;
     f0.f64 = f31.f64 * f31.f64;
 
+    const uint32_t sp = static_cast<uint32_t>(r1.u64);
     if (sp) {
         WriteGuestF32(base, sp + 0x70, static_cast<float>(f29.f64));
         WriteGuestF32(base, sp + 0x74, static_cast<float>(f30.f64));
         WriteGuestF32(base, sp + 0x78, static_cast<float>(f31.f64));
     }
-}
-
-// BadassBaboon's Recomp Adjustments: Continuous vehicle-relative target camera tracking during active transitions
-// In sub_8271F438 at 0x8271F46C (cameraTransition::Update):
-// r27 is the cameraTransition object.
-// Offset 196 (0xC4) is cam_dst (destination chase camera).
-// Offset 144 (0x90) in cam_dst is target2 (pointer to vehicle transform matrix).
-// When the car drives or turns during transitions, cam_dst was previously frozen in world space,
-// causing delta_dst = cam_dst - vehicle to stretch backwards and misalign laterally, making the
-// camera severely lag and snap at transition completion.
-// By projecting cam_dst's initial offset and rotation into the vehicle's local coordinate frame,
-// and reconstructing cam_dst's live pose every frame:
-//   P_dst_live(t) = P_veh(t) + R_veh(t) * O_local
-//   M_dst_live(t) = M_rel * R_veh(t)
-// cam_dst moves perfectly with the car throughout the entire transition with zero position error.
-// Handover on completion (sub_8271F3B0) is 100% seamless with zero pop, zero lag, and zero jitter.
-
-struct ActiveTransitionState {
-    uint32_t transition_ptr = 0;
-    uint32_t cam_dst = 0;
-    uint32_t target_veh = 0;
-    bool initialized = false;
-    float local_offset[3] = {0.0f, 0.0f, 0.0f};
-    float rel_rot[3][3] = {};
-};
-static ActiveTransitionState s_transition_state;
-
-void MCLACameraTransitionLiveSync(PPCRegister& r27) {
-    if (!REXCVAR_GET(smooth_camera_transitions)) return;
-
-    auto* base = rex::Runtime::instance()->virtual_membase();
-    if (!base) return;
-
-    const uint32_t trans = static_cast<uint32_t>(r27.u64);
-    if (!trans) return;
-
-    const uint32_t cam_dst = ReadGuestU32(base, trans + 196);
-    if (!cam_dst) return;
-
-    const uint32_t target_veh = ReadGuestU32(base, cam_dst + 144);
-    if (!target_veh) return;
-
-    const float trem = ReadGuestF32(base, trans + 212);
-    const float dt = ReadGuestF32(base, kGuestFrameDelta);
-
-    // If a new transition started or target changed, capture initial local vehicle-relative offset & orientation
-    if (!s_transition_state.initialized ||
-        s_transition_state.transition_ptr != trans ||
-        s_transition_state.cam_dst != cam_dst ||
-        s_transition_state.target_veh != target_veh) {
-
-        s_transition_state.transition_ptr = trans;
-        s_transition_state.cam_dst = cam_dst;
-        s_transition_state.target_veh = target_veh;
-        s_transition_state.initialized = false;
-
-        // Vehicle initial position and orthonormal orientation (R, U, F)
-        const float P_veh[3] = {
-            ReadGuestF32(base, target_veh + 48),
-            ReadGuestF32(base, target_veh + 52),
-            ReadGuestF32(base, target_veh + 56),
-        };
-        const float R_veh[3] = { ReadGuestF32(base, target_veh + 0),  ReadGuestF32(base, target_veh + 4),  ReadGuestF32(base, target_veh + 8)  };
-        const float U_veh[3] = { ReadGuestF32(base, target_veh + 16), ReadGuestF32(base, target_veh + 20), ReadGuestF32(base, target_veh + 24) };
-        const float F_veh[3] = { ReadGuestF32(base, target_veh + 32), ReadGuestF32(base, target_veh + 36), ReadGuestF32(base, target_veh + 40) };
-
-        // Destination camera initial position
-        const float P_dst[3] = {
-            ReadGuestF32(base, cam_dst + 64),
-            ReadGuestF32(base, cam_dst + 68),
-            ReadGuestF32(base, cam_dst + 72),
-        };
-
-        const float dx = P_dst[0] - P_veh[0];
-        const float dy = P_dst[1] - P_veh[1];
-        const float dz = P_dst[2] - P_veh[2];
-        const float dist_sq = dx * dx + dy * dy + dz * dz;
-
-        // Valid chase / POV / bumper camera boom offsets are typically 0.5m - 50m
-        if (dist_sq >= 0.25f && dist_sq <= 2500.0f) {
-            // Project world offset into vehicle local coordinates: o = R_veh * delta
-            s_transition_state.local_offset[0] = dx * R_veh[0] + dy * R_veh[1] + dz * R_veh[2];
-            s_transition_state.local_offset[1] = dx * U_veh[0] + dy * U_veh[1] + dz * U_veh[2];
-            s_transition_state.local_offset[2] = dx * F_veh[0] + dy * F_veh[1] + dz * F_veh[2];
-
-            // Compute relative rotation: M_rel = M_cam * R_veh^T
-            for (int i = 0; i < 3; ++i) {
-                const float cam_rx = ReadGuestF32(base, cam_dst + 16 + i * 16 + 0);
-                const float cam_ry = ReadGuestF32(base, cam_dst + 16 + i * 16 + 4);
-                const float cam_rz = ReadGuestF32(base, cam_dst + 16 + i * 16 + 8);
-
-                s_transition_state.rel_rot[i][0] = cam_rx * R_veh[0] + cam_ry * R_veh[1] + cam_rz * R_veh[2];
-                s_transition_state.rel_rot[i][1] = cam_rx * U_veh[0] + cam_ry * U_veh[1] + cam_rz * U_veh[2];
-                s_transition_state.rel_rot[i][2] = cam_rx * F_veh[0] + cam_ry * F_veh[1] + cam_rz * F_veh[2];
-            }
-
-            s_transition_state.initialized = true;
-        }
-    }
-
-    if (!s_transition_state.initialized) return;
-
-    // Read live vehicle pose
-    const float P_veh[3] = {
-        ReadGuestF32(base, target_veh + 48),
-        ReadGuestF32(base, target_veh + 52),
-        ReadGuestF32(base, target_veh + 56),
-    };
-    const float R_veh[3] = { ReadGuestF32(base, target_veh + 0),  ReadGuestF32(base, target_veh + 4),  ReadGuestF32(base, target_veh + 8)  };
-    const float U_veh[3] = { ReadGuestF32(base, target_veh + 16), ReadGuestF32(base, target_veh + 20), ReadGuestF32(base, target_veh + 24) };
-    const float F_veh[3] = { ReadGuestF32(base, target_veh + 32), ReadGuestF32(base, target_veh + 36), ReadGuestF32(base, target_veh + 40) };
-
-    // Reconstruct live destination camera position in world space
-    const float P_dst_live[3] = {
-        P_veh[0] + s_transition_state.local_offset[0] * R_veh[0] + s_transition_state.local_offset[1] * U_veh[0] + s_transition_state.local_offset[2] * F_veh[0],
-        P_veh[1] + s_transition_state.local_offset[0] * R_veh[1] + s_transition_state.local_offset[1] * U_veh[1] + s_transition_state.local_offset[2] * F_veh[1],
-        P_veh[2] + s_transition_state.local_offset[0] * R_veh[2] + s_transition_state.local_offset[1] * U_veh[2] + s_transition_state.local_offset[2] * F_veh[2],
-    };
-
-    // Reconstruct live rotation matrix: M_live = M_rel * R_veh
-    for (int i = 0; i < 3; ++i) {
-        const float rx = s_transition_state.rel_rot[i][0] * R_veh[0] + s_transition_state.rel_rot[i][1] * U_veh[0] + s_transition_state.rel_rot[i][2] * F_veh[0];
-        const float ry = s_transition_state.rel_rot[i][0] * R_veh[1] + s_transition_state.rel_rot[i][1] * U_veh[1] + s_transition_state.rel_rot[i][2] * F_veh[1];
-        const float rz = s_transition_state.rel_rot[i][0] * R_veh[2] + s_transition_state.rel_rot[i][1] * U_veh[2] + s_transition_state.rel_rot[i][2] * F_veh[2];
-
-        WriteGuestF32(base, cam_dst + 16 + i * 16 + 0, rx);
-        WriteGuestF32(base, cam_dst + 16 + i * 16 + 4, ry);
-        WriteGuestF32(base, cam_dst + 16 + i * 16 + 8, rz);
-    }
-
-    // Write live position to destination camera matrix row 3
-    WriteGuestF32(base, cam_dst + 64, P_dst_live[0]);
-    WriteGuestF32(base, cam_dst + 68, P_dst_live[1]);
-    WriteGuestF32(base, cam_dst + 72, P_dst_live[2]);
-
-    // Synchronize camBoomCS tracked position & lookat state to eliminate handover lag & error
-    WriteGuestF32(base, cam_dst + 416, P_dst_live[0]);
-    WriteGuestF32(base, cam_dst + 420, P_dst_live[1]);
-    WriteGuestF32(base, cam_dst + 424, P_dst_live[2]);
-
-    WriteGuestF32(base, cam_dst + 432, P_veh[0]);
-    WriteGuestF32(base, cam_dst + 436, P_veh[1]);
-    WriteGuestF32(base, cam_dst + 440, P_veh[2]);
-
-    // Ensure snap flag is clear so no raw physics vibrations are introduced
-    base[cam_dst + 664] = 0;
-
-    // Seed tracking speed headroom
-    const float cur_spd = ReadGuestF32(base, cam_dst + 656);
-    if (cur_spd < 25.0f) {
-        WriteGuestF32(base, cam_dst + 656, 25.0f);
-    }
-
-    // On final frame of the transition (timer running out), copy destination pose directly
-    // into transition camera matrix (trans + 16) and position (trans + 64) to eliminate fractional gap
-    if (dt > 0.0f && (trem - dt) <= 0.0f) {
-        for (int i = 0; i < 4; ++i) {
-            for (int j = 0; j < 4; ++j) {
-                const uint32_t val = ReadGuestU32(base, cam_dst + 16 + (i * 4 + j) * 4);
-                WriteGuestU32(base, trans + 16 + (i * 4 + j) * 4, val);
-            }
-        }
-        s_transition_state.initialized = false;
-        s_transition_state.transition_ptr = 0;
-    }
-}
-
-// BadassBaboon's Recomp Adjustments: Lookaround & camera boom gimbal continuous-time exponential smoothing
-// In sub_822B2AB0 (mcPlayerCamera update at 0x822B30A4):
-// f31 is the raw per-frame LookaroundLerpFactor k0 (tune+48).
-// Converting to continuous-time exponential retention:
-//   k(dt) = 1.0 - (1.0 - k0)^(30 * dt * sens)
-// preserves responsive right-stick lookaround and prevents sluggish gimbal lag at high FPS.
-void MCLACameraGimbalSmoothing(PPCRegister& f31) {
-    if (!REXCVAR_GET(smooth_camera_gimbal)) return;
-
-    auto* base = rex::Runtime::instance()->virtual_membase();
-    if (!base) return;
-
-    const float dt = ReadGuestF32(base, kGuestFrameDelta);
-    const double raw_k = f31.f64;
-    if (raw_k <= 0.0 || raw_k >= 1.0 || dt <= 0.0f) return;
-
-    const double sens = REXCVAR_GET(camera_gimbal_sensitivity);
-    f31.f64 = 1.0 - std::pow(1.0 - raw_k, static_cast<double>(dt) * 30.0 * sens);
-}
-
-// BadassBaboon's Recomp Adjustments: Lookaround yaw shortest-path angular delta
-// In sub_822B2AB0 at 0x822B30AC: fsubs f0, f27, f1 computes delta_yaw = target - current.
-// Normalizes delta into [-pi, +pi] to prevent 360-degree snap spins across the +/-pi seam.
-void MCLACameraYawShortestPath(PPCRegister& f0) {
-    double d = f0.f64;
-    constexpr double kPi = 3.14159265358979323846;
-    constexpr double kTwoPi = 6.28318530717958647692;
-    while (d > kPi) d -= kTwoPi;
-    while (d < -kPi) d += kTwoPi;
-    f0.f64 = d;
-}
-
-// BadassBaboon's Recomp Adjustments: Orbit / intro camera shortest-path Euler unwrapping
-// In sub_823224E0 (camTrackCS / mcCinematicCS update):
-// Shortest-path unwraps target Euler angles relative to reference angles into [-pi, +pi].
-// Eliminates 360-degree camera flips, jerks, and seam snapping during circular orbits around the car.
-static void UnwrapEulerDelta(uint8_t* base, uint32_t sp, uint32_t ref_offset, uint32_t tgt_offset) {
-    constexpr double kPi = 3.14159265358979323846;
-    constexpr double kTwoPi = 6.28318530717958647692;
-
-    for (int i = 0; i < 3; ++i) {
-        const float ref_val = ReadGuestF32(base, sp + ref_offset + i * 4);
-        const float tgt_val = ReadGuestF32(base, sp + tgt_offset + i * 4);
-
-        double diff = static_cast<double>(tgt_val) - static_cast<double>(ref_val);
-        while (diff > kPi) diff -= kTwoPi;
-        while (diff < -kPi) diff += kTwoPi;
-
-        WriteGuestF32(base, sp + tgt_offset + i * 4, static_cast<float>(static_cast<double>(ref_val) + diff));
-    }
-}
-
-void MCLATrackEulerShortestPath1(PPCRegister& r1) {
-    if (!REXCVAR_GET(smooth_track_camera)) return;
-
-    auto* base = rex::Runtime::instance()->virtual_membase();
-    if (!base) return;
-
-    const uint32_t sp = static_cast<uint32_t>(r1.u64);
-    if (!sp) return;
-
-    UnwrapEulerDelta(base, sp, 0x70, 0x50);
-}
-
-void MCLATrackEulerShortestPath2(PPCRegister& r1) {
-    if (!REXCVAR_GET(smooth_track_camera)) return;
-
-    auto* base = rex::Runtime::instance()->virtual_membase();
-    if (!base) return;
-
-    const uint32_t sp = static_cast<uint32_t>(r1.u64);
-    if (!sp) return;
-
-    UnwrapEulerDelta(base, sp, 0x70, 0x60);
-}
-
-// BadassBaboon's Recomp Adjustments: Tracker velocity rate-limiter continuous-time exponential scaling
-// In sub_823223E8 at 0x82322444:
-// Converts raw 30 FPS filter retention factor (0.7 at a1+280) to continuous-time exponential decay:
-//   k(dt) = 1 - (1 - k)^(30 * dt)
-// Ensures the velocity history filter retains identical physical damping at 60, 120, and 240 FPS.
-void MCLATrackerRateSmoothing(PPCRegister& f10) {
-    if (!REXCVAR_GET(smooth_track_camera)) return;
-
-    auto* base = rex::Runtime::instance()->virtual_membase();
-    if (!base) return;
-
-    const float dt = ReadGuestF32(base, kGuestFrameDelta);
-    const double raw_k = f10.f64;
-    if (raw_k <= 0.0 || raw_k >= 1.0 || dt <= 0.0f) return;
-
-    f10.f64 = 1.0 - std::pow(1.0 - raw_k, static_cast<double>(dt) * 30.0);
-}
-
-// BadassBaboon's Recomp Adjustments: Camera boom collision zoom distance continuous-time damping
-// In sub_8231B740 at 0x8231C320 and 0x8231C3A0:
-// Converts raw 30 FPS boom collision distance lerp factor (0.3) to continuous-time exponential decay.
-// Eliminates rapid zoom pumping and snapping when driving near walls, light poles, or barriers.
-static void ApplyBoomZoomDamping(PPCRegister& f0) {
-    if (!REXCVAR_GET(smooth_boom_zoom)) return;
-
-    auto* base = rex::Runtime::instance()->virtual_membase();
-    if (!base) return;
-
-    const float dt = ReadGuestF32(base, kGuestFrameDelta);
-    const double raw_k = f0.f64;
-    if (raw_k <= 0.0 || raw_k >= 1.0 || dt <= 0.0f) return;
-
-    f0.f64 = 1.0 - std::pow(1.0 - raw_k, static_cast<double>(dt) * 30.0);
-}
-
-void MCLACameraBoomZoomDamping1(PPCRegister& f0) {
-    ApplyBoomZoomDamping(f0);
-}
-
-void MCLACameraBoomZoomDamping2(PPCRegister& f0) {
-    ApplyBoomZoomDamping(f0);
 }
 #else // REXGLUE_HAS_XEO3_TARGET
 // XEO3 stubs: empty implementations so the linker resolves codegen calls.
@@ -767,13 +383,6 @@ void Patch_DebugCam(PPCRegister& r3) {}
 void Patch_FOVScale(PPCRegister& f1, PPCRegister& r24) {}
 void MCLACameraPosSmoothing(PPCRegister& f13) {}
 void MCLACameraLookAtSmoothing(PPCRegister& f0) {}
-void MCLACameraShakeFilter(PPCRegister& f31, PPCRegister& f30, PPCRegister& f29, PPCRegister& f0, PPCRegister& r28, PPCRegister& r1) {}
-void MCLACameraTransitionLiveSync(PPCRegister& r27) {}
-void MCLACameraGimbalSmoothing(PPCRegister& f31) {}
-void MCLACameraYawShortestPath(PPCRegister& f0) {}
-void MCLATrackEulerShortestPath1(PPCRegister& r1) {}
-void MCLATrackEulerShortestPath2(PPCRegister& r1) {}
-void MCLATrackerRateSmoothing(PPCRegister& f10) {}
-void MCLACameraBoomZoomDamping1(PPCRegister& f0) {}
-void MCLACameraBoomZoomDamping2(PPCRegister& f0) {}
+void MCLACameraShakeFilter(PPCRegister& f31, PPCRegister& f30, PPCRegister& f29, PPCRegister& f0, PPCRegister& r1) {}
 #endif // REXGLUE_HAS_XEO3_TARGET
+
